@@ -1336,6 +1336,77 @@ $(_run_reviewer_brief "$repo" "$pr" "$review_head" "$review_base" "$review_path"
   herdr agent start "$agent_name" --kind "$runtime" --pane "$pane_id" -- "${AGENT_ARGS[@]}"
 }
 
+
+# THE PROCESS IN A PANE, found downward from the pane's shell. The env-keyed
+# lookup above only sees a process `cel run` launched: when the herdr server
+# restarted (2026-09-28) it brought every orchestrator back as a bare
+# `omp --resume=<file>` with none of the launch env, and they were invisible
+# to it. The pane's shell is the one fact herdr still has, so walk its
+# descendants for the runtime binary; the newest one is the live agent.
+_run_pane_agent_pid() { # <pane> <runtime> -> pid, or fail
+  local shell root d pid ppid a0 best="" frontier next
+  shell="$(herdr pane process-info "$1" 2>/dev/null \
+    | jq -r '.result.process_info.shell_pid // empty' 2>/dev/null)" || return 1
+  [ -n "$shell" ] || return 1
+  root="$(_run_proc_root)"
+  local -A kids=()
+  for d in "$root"/[0-9]*; do
+    [ -r "$d/status" ] || continue
+    ppid="$(awk '/^PPid:/{print $2; exit}' "$d/status" 2>/dev/null)" || continue
+    [ -n "$ppid" ] || continue
+    kids[$ppid]="${kids[$ppid]:-} ${d##*/}"
+  done
+  frontier="$shell"
+  while [ -n "${frontier// /}" ]; do
+    next=""
+    for pid in $frontier; do
+      a0="$(tr '\0' '\n' < "$root/$pid/cmdline" 2>/dev/null | sed -n 1p)" || a0=""
+      if [ "$pid" != "$shell" ] && [ "${a0##*/}" = "$2" ]; then
+        if [ -z "$best" ] || [ "$pid" -gt "$best" ]; then best="$pid"; fi
+      fi
+      next="$next ${kids[$pid]:-}"
+    done
+    frontier="$next"
+  done
+  [ -n "$best" ] || return 1
+  printf '%s' "$best"
+}
+
+# Every live orchestrator whose runtime takes an inbox hook, and whether its
+# process actually carries it. One row each:
+#   name<TAB>workspace<TAB>product<TAB>pane<TAB>status<TAB>ok|stripped<TAB>restart-command
+# A process that cannot be found yields no row: no evidence is not a fault.
+run_stripped_orchestrators() {
+  local roster ws wsdir p name cwd rt hookfile live lname lpane lstatus pid state
+  have herdr && have jq || return 0
+  roster="$(herdr agent list 2>/dev/null)" || return 0
+  for ws in $(registry_names 2>/dev/null); do
+    wsdir="$(registry_path "$ws" 2>/dev/null)" || continue
+    [ -f "$wsdir/workspace.yaml" ] || continue
+    for p in $(ws_product_names "$wsdir" 2>/dev/null); do
+      name="$(_run_agent_name "$p/orch")"; cwd="$(ws_product_dir "$wsdir" "$p")"
+      live="$(printf '%s' "$roster" | jq -r --arg n "$name" --arg c "$cwd" '
+        [.result.agents[]? | select((.pane_id // "") != "")] as $a
+        | [$a[] | select(.name == $n)] as $byname
+        | [$a[] | select((.cwd // "") == $c)] as $bycwd
+        | (if ($byname | length) > 0 then $byname[0]
+           elif ($bycwd | length) == 1 then $bycwd[0] else empty end)
+        | [((.name // "") | if . == "" then "-" else . end), .pane_id,
+           (.agent_status // "unknown"), (.agent // "")] | @tsv' 2>/dev/null)" || live=""
+      [ -n "$live" ] || continue
+      IFS=$'\t' read -r lname lpane lstatus rt <<< "$live"
+      [ -n "$rt" ] || rt="$(ws_runtime "$wsdir" orchestrator)"
+      hookfile="$(agent_inbox_hook "$rt" file 2>/dev/null)" || hookfile=""
+      [ -n "$hookfile" ] || continue   # claude: Monitor, not a hook
+      pid="$(_run_pane_agent_pid "$lpane" "$rt")" || continue
+      if _run_cmdline "$pid" | grep -qF -- "${hookfile##*/}"; then state=ok; else state=stripped; fi
+      [ "$lname" != "-" ] || lname="$name"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$lname" "$ws" "$p" "$lpane" "$lstatus" "$state" \
+        "cel run orchestrator --product $p --workspace $ws --restart"
+    done
+  done
+  return 0
+}
 # STALE LAUNCH LINES. `cel update` changes hooks and launch flags, but a
 # running orchestrator keeps the command line it started with: the inbox hook
 # (CEL-65) and --no-prewalk (CEL-68) silently did not apply to any
